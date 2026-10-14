@@ -6,6 +6,7 @@ Built with Python, OpenCV, MediaPipe, and Streamlit.
 
 Monitors real-time Eye Aspect Ratio (EAR) via laptop webcam.
 Identifies sustained eye closure and triggers multi-modal audio/visual alerts.
+Supports Live Laptop Stream, Browser Camera Snapshot, and Image Upload.
 """
 
 import os
@@ -22,6 +23,7 @@ warnings.filterwarnings("ignore")
 import cv2
 import numpy as np
 import pandas as pd
+from PIL import Image
 import streamlit as st
 
 from drowsiness_detector import DrowsinessDetector
@@ -161,22 +163,35 @@ if "model_ready" not in st.session_state:
 # Sidebar Controls & Parameters
 # ---------------------------------------------------------
 with st.sidebar:
-    st.markdown("### 🎛️ System Controls")
-    
-    # Start and Stop Buttons
-    col_start, col_stop = st.columns(2)
-    start_clicked = col_start.button("▶️ Start", type="primary", width="stretch", disabled=st.session_state.monitoring)
-    stop_clicked = col_stop.button("⏹️ Stop", width="stretch", disabled=not st.session_state.monitoring)
-
-    if start_clicked:
-        st.session_state.monitoring = True
-        st.rerun()
-
-    if stop_clicked:
-        st.session_state.monitoring = False
-        st.rerun()
+    st.markdown("### 🎛️ Operation Mode")
+    app_mode = st.radio(
+        "Choose Mode:",
+        options=[
+            "🎥 Live Webcam Stream (Laptop Demo)",
+            "📸 Browser Camera Snapshot (Cloud Demo)",
+            "📁 Upload Face Image"
+        ],
+        index=0,
+        help="Use 'Live Webcam Stream' for continuous real-time monitoring on your laptop."
+    )
 
     st.divider()
+
+    if app_mode == "🎥 Live Webcam Stream (Laptop Demo)":
+        st.markdown("### 🚦 Stream Controls")
+        col_start, col_stop = st.columns(2)
+        start_clicked = col_start.button("▶️ Start", type="primary", width="stretch", disabled=st.session_state.monitoring)
+        stop_clicked = col_stop.button("⏹️ Stop", width="stretch", disabled=not st.session_state.monitoring)
+
+        if start_clicked:
+            st.session_state.monitoring = True
+            st.rerun()
+
+        if stop_clicked:
+            st.session_state.monitoring = False
+            st.rerun()
+
+        st.divider()
 
     st.markdown("### ⚙️ Detection Parameters")
     
@@ -209,13 +224,14 @@ with st.sidebar:
 
     st.divider()
 
-    st.markdown("### 📷 Camera & Display")
-    camera_index = st.selectbox(
-        "Select Camera Index",
-        options=[0, 1, 2],
-        index=0,
-        help="0 is usually your laptop's built-in webcam. 1 or 2 is an external USB camera."
-    )
+    st.markdown("### 📷 Camera & Visuals")
+    if app_mode == "🎥 Live Webcam Stream (Laptop Demo)":
+        camera_index = st.selectbox(
+            "Select Camera Index",
+            options=[0, 1, 2],
+            index=0,
+            help="0 is usually your laptop's built-in webcam. 1 or 2 is an external USB camera."
+        )
 
     show_landmarks = st.checkbox("Show Eye Landmark Contours", value=True)
     enable_sound = st.checkbox("Enable Audio Warning Beep", value=True)
@@ -325,170 +341,262 @@ update_metrics(
 
 # Placeholders for dynamic content
 alert_banner_placeholder = st.empty()
-stop_bar_placeholder = st.empty()
-video_placeholder = st.empty()
-chart_placeholder = st.empty()
 
 
 # ---------------------------------------------------------
-# Live Video Stream & Inference Loop
+# MODE 1: LIVE WEBCAM STREAM (LAPTOP RUNNER)
 # ---------------------------------------------------------
-if st.session_state.monitoring:
-    # Quick Stop button right above the video feed for instant user response
-    if stop_bar_placeholder.button("⏹️ Stop Live Monitoring", type="secondary", width="stretch", key="main_stop_btn"):
-        st.session_state.monitoring = False
-        st.rerun()
+if app_mode == "🎥 Live Webcam Stream (Laptop Demo)":
+    stop_bar_placeholder = st.empty()
+    video_placeholder = st.empty()
+    chart_placeholder = st.empty()
 
-    # Initialize Detector and Audio
-    try:
+    if st.session_state.monitoring:
+        # Quick Stop button right above the video feed for instant user response
+        if stop_bar_placeholder.button("⏹️ Stop Live Monitoring", type="secondary", width="stretch", key="main_stop_btn"):
+            st.session_state.monitoring = False
+            st.rerun()
+
+        # Initialize Detector and Audio
+        try:
+            detector = DrowsinessDetector(
+                ear_threshold=ear_threshold,
+                consecutive_frames_threshold=consecutive_frames,
+                time_threshold_seconds=time_threshold,
+                model_path=st.session_state.get("model_path")
+            )
+            audio = get_audio_alert(cooldown_seconds=1.0, enabled=enable_sound)
+        except Exception as e:
+            st.error(f"Failed to initialize computer vision pipeline: {e}")
+            st.session_state.monitoring = False
+            st.stop()
+
+        # Attempt to open webcam
+        cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(camera_index)
+
+        if not cap.isOpened():
+            st.error(f"❌ Could not open webcam at Camera Index {camera_index}!")
+            st.markdown("""
+            **Troubleshooting suggestions:**
+            - Ensure your webcam is not being used by another application (Zoom, Teams, Skype, or browser tab).
+            - Verify camera permissions in **Windows Settings > Privacy & security > Camera**.
+            - If using an external webcam, try changing **Select Camera Index** to `1` or `2` in the sidebar.
+            """)
+            st.session_state.monitoring = False
+            st.stop()
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+        alert_banner_placeholder.markdown("""
+        <div class="alert-banner-safe">
+            🟢 Live Monitoring Active — Focus on the road. Eyes are being analyzed in real-time.
+        </div>
+        """, unsafe_allow_html=True)
+
+        try:
+            frame_counter = 0
+            while st.session_state.monitoring:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    st.warning("Webcam frame capture returned empty. Camera may be disconnected.")
+                    time.sleep(0.1)
+                    break
+
+                # Mirror horizontally for natural webcam experience
+                frame = cv2.flip(frame, 1)
+
+                # AI Inference
+                result = detector.process_frame(frame, draw_landmarks=show_landmarks)
+                annotated_frame = result["annotated_frame"]
+
+                # Update session total alerts
+                st.session_state.total_alerts = result["total_alerts"]
+
+                # Handle Audio and Banner Alerts
+                if result["is_drowsy"]:
+                    alert_banner_placeholder.markdown("""
+                    <div class="alert-banner-drowsy">
+                        ⚠️ ALERT: PROLONGED EYE CLOSURE DETECTED! WAKE UP!
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    if enable_sound:
+                        audio.trigger(frequency=1400, duration_ms=300)
+
+                    # Log event if rising edge
+                    if result["alert_triggered"]:
+                        st.session_state.event_logs.append({
+                            "Time": time.strftime("%H:%M:%S"),
+                            "Event": "Drowsiness Warning",
+                            "EAR": round(result["ear_avg"], 3),
+                            "Duration (s)": round(result["closed_duration"], 1)
+                        })
+                else:
+                    if result["face_detected"]:
+                        alert_banner_placeholder.markdown("""
+                        <div class="alert-banner-safe">
+                            🟢 Driver Attentive — Normal Eye Aspect Ratio Detected.
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        alert_banner_placeholder.markdown("""
+                        <div class="alert-banner-safe" style="color: #f59e0b; border-color: rgba(245, 158, 11, 0.4); background: rgba(245, 158, 11, 0.1);">
+                            ⚠️ Notice: No face detected in frame. Please align with the webcam.
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                # Update KPI cards every 2 frames for smooth UI performance
+                frame_counter += 1
+                if frame_counter % 2 == 0:
+                    update_metrics(
+                        eye_status=result["eye_status"],
+                        ear_val=result["ear_avg"],
+                        total_alerts=st.session_state.total_alerts,
+                        monitoring=True,
+                        is_drowsy=result["is_drowsy"]
+                    )
+
+                    # Append to history buffer
+                    if result["face_detected"]:
+                        st.session_state.ear_history.append(result["ear_avg"])
+
+                # Render live video frame using width="stretch"
+                rgb_view = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                video_placeholder.image(rgb_view, channels="RGB", width="stretch")
+
+                # Smooth frame rate limiter (~30 FPS)
+                time.sleep(0.02)
+
+        finally:
+            cap.release()
+            cv2.destroyAllWindows()
+
+    else:
+        # When monitoring is stopped / idle
+        alert_banner_placeholder.markdown("""
+        <div class="alert-banner-safe" style="color: #94a3b8; border-color: #334155; background: #0f172a;">
+            ⏸️ System Idle. Click <strong>'▶️ Start'</strong> in the sidebar to begin real-time drowsiness monitoring.
+        </div>
+        """, unsafe_allow_html=True)
+
+        col_guide1, col_guide2 = st.columns(2)
+        with col_guide1:
+            st.markdown("### 🔬 How It Works")
+            st.markdown("""
+            1. **Facial Landmark Mesh**: The laptop webcam captures real-time video frames. Google MediaPipe's deep-learning model maps **468 3D facial landmarks**.
+            2. **Eye Aspect Ratio (EAR)**: The 6 landmark coordinates surrounding each eye are extracted:
+               $$\\text{EAR} = \\frac{||P_2 - P_6|| + ||P_3 - P_5||}{2 \\cdot ||P_1 - P_4||}$$
+            3. **Closure Threshold**: When eyes open, EAR is $\\approx 0.28 - 0.38$. When closed, EAR plummets below $0.20$.
+            4. **Temporal Filter**: A normal human blink lasts $100 - 300\\text{ ms}$. If eye closure persists for $> 1.5\\text{ seconds}$ (or $\\ge 25$ frames), a **Drowsiness Alert** triggers.
+            """)
+
+        with col_guide2:
+            st.markdown("### 📋 Quick Demonstration Checklist")
+            st.markdown("""
+            - [x] Click **'▶️ Start'** in the left sidebar.
+            - [x] Allow webcam access when prompted by the OS.
+            - [x] Verify green eye landmark contours surround your eyes.
+            - [x] **Test 1 - Normal Blink**: Blink naturally; verify system remains **Normal**.
+            - [x] **Test 2 - Sustained Eye Closure**: Close your eyes for $> 2\\text{ seconds}$; verify the red warning banner and sound alert trigger.
+            - [x] Open your eyes again; verify the system resets immediately to **Normal**.
+            - [x] Click **'⏹️ Stop'** when finished.
+            """)
+
+
+# ---------------------------------------------------------
+# MODE 2: BROWSER CAMERA SNAPSHOT (WORKS ON CLOUD / MOBILE)
+# ---------------------------------------------------------
+elif app_mode == "📸 Browser Camera Snapshot (Cloud Demo)":
+    st.markdown("### 📸 Browser Camera Snapshot Mode")
+    st.info("💡 This mode uses your web browser's camera. It works anywhere, including cloud deployments like Streamlit Community Cloud!")
+
+    snapshot = st.camera_input("Capture a photo of your face (Test Open vs. Closed Eyes)")
+
+    if snapshot is not None:
+        # Convert buffer to OpenCV image
+        file_bytes = np.asarray(bytearray(snapshot.read()), dtype=np.uint8)
+        frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
         detector = DrowsinessDetector(
             ear_threshold=ear_threshold,
-            consecutive_frames_threshold=consecutive_frames,
-            time_threshold_seconds=time_threshold,
+            consecutive_frames_threshold=1,
+            time_threshold_seconds=0.0,
             model_path=st.session_state.get("model_path")
         )
-        audio = get_audio_alert(cooldown_seconds=1.0, enabled=enable_sound)
-    except Exception as e:
-        st.error(f"Failed to initialize computer vision pipeline: {e}")
-        st.session_state.monitoring = False
-        st.stop()
+        result = detector.process_frame(frame, draw_landmarks=show_landmarks)
 
-    # Attempt to open webcam
-    cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(camera_index)
+        # Update metrics
+        update_metrics(
+            eye_status=result["eye_status"],
+            ear_val=result["ear_avg"],
+            total_alerts=st.session_state.total_alerts,
+            monitoring=False
+        )
 
-    if not cap.isOpened():
-        st.error(f"❌ Could not open webcam at Camera Index {camera_index}!")
-        st.markdown("""
-        **Troubleshooting suggestions:**
-        - Ensure your webcam is not being used by another application (Zoom, Teams, Skype, or browser tab).
-        - Verify camera permissions in **Windows Settings > Privacy & security > Camera**.
-        - If using an external webcam, try changing **Select Camera Index** to `1` or `2` in the sidebar.
-        """)
-        st.session_state.monitoring = False
-        st.stop()
+        col_img1, col_img2 = st.columns([3, 2])
+        with col_img1:
+            rgb_result = cv2.cvtColor(result["annotated_frame"], cv2.COLOR_BGR2RGB)
+            st.image(rgb_result, caption="AI Landmark & EAR Analysis", width="stretch")
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-    # Inform user of active monitoring
-    alert_banner_placeholder.markdown("""
-    <div class="alert-banner-safe">
-        🟢 Live Monitoring Active — Focus on the road. Eyes are being analyzed in real-time.
-    </div>
-    """, unsafe_allow_html=True)
-
-    try:
-        frame_counter = 0
-        while st.session_state.monitoring:
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                st.warning("Webcam frame capture returned empty. Camera may be disconnected.")
-                time.sleep(0.1)
-                break
-
-            # Mirror horizontally for natural webcam experience
-            frame = cv2.flip(frame, 1)
-
-            # AI Inference
-            result = detector.process_frame(frame, draw_landmarks=show_landmarks)
-            annotated_frame = result["annotated_frame"]
-
-            # Update session total alerts
-            st.session_state.total_alerts = result["total_alerts"]
-
-            # Handle Audio and Banner Alerts
-            if result["is_drowsy"]:
-                alert_banner_placeholder.markdown("""
-                <div class="alert-banner-drowsy">
-                    ⚠️ ALERT: PROLONGED EYE CLOSURE DETECTED! WAKE UP!
-                </div>
-                """, unsafe_allow_html=True)
-
-                if enable_sound:
-                    audio.trigger(frequency=1400, duration_ms=300)
-
-                # Log event if rising edge
-                if result["alert_triggered"]:
-                    st.session_state.event_logs.append({
-                        "Time": time.strftime("%H:%M:%S"),
-                        "Event": "Drowsiness Warning",
-                        "EAR": round(result["ear_avg"], 3),
-                        "Duration (s)": round(result["closed_duration"], 1)
-                    })
-            else:
-                if result["face_detected"]:
-                    alert_banner_placeholder.markdown("""
-                    <div class="alert-banner-safe">
-                        🟢 Driver Attentive — Normal Eye Aspect Ratio Detected.
-                    </div>
-                    """, unsafe_allow_html=True)
+        with col_img2:
+            st.markdown("#### Snapshot Diagnostic Results")
+            if result["face_detected"]:
+                if result["ear_avg"] < ear_threshold:
+                    st.error(f"😴 **EYES CLOSED DETECTED!**\n\nEAR: **{result['ear_avg']:.3f}** (Below threshold {ear_threshold:.2f})")
                 else:
-                    alert_banner_placeholder.markdown("""
-                    <div class="alert-banner-safe" style="color: #f59e0b; border-color: rgba(245, 158, 11, 0.4); background: rgba(245, 158, 11, 0.1);">
-                        ⚠️ Notice: No face detected in frame. Please align with the webcam.
-                    </div>
-                    """, unsafe_allow_html=True)
+                    st.success(f"👁️ **EYES OPEN & ATTENTIVE!**\n\nEAR: **{result['ear_avg']:.3f}** (Above threshold {ear_threshold:.2f})")
 
-            # Update KPI cards every 2 frames for smooth UI performance
-            frame_counter += 1
-            if frame_counter % 2 == 0:
-                update_metrics(
-                    eye_status=result["eye_status"],
-                    ear_val=result["ear_avg"],
-                    total_alerts=st.session_state.total_alerts,
-                    monitoring=True,
-                    is_drowsy=result["is_drowsy"]
-                )
+                st.write(f"- **Left Eye EAR:** {result['ear_left']:.3f}")
+                st.write(f"- **Right Eye EAR:** {result['ear_right']:.3f}")
+                st.write(f"- **Average EAR:** {result['ear_avg']:.3f}")
+            else:
+                st.warning("⚠️ No face was detected in this photo. Please face the camera and try again.")
 
-                # Append to history buffer
-                if result["face_detected"]:
-                    st.session_state.ear_history.append(result["ear_avg"])
 
-            # Render live video frame using width="stretch" (compatible with Streamlit 1.65+)
-            rgb_view = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-            video_placeholder.image(rgb_view, channels="RGB", width="stretch")
+# ---------------------------------------------------------
+# MODE 3: UPLOAD FACE IMAGE
+# ---------------------------------------------------------
+elif app_mode == "📁 Upload Face Image":
+    st.markdown("### 📁 Upload Face Photo for EAR Analysis")
+    uploaded_file = st.file_uploader("Upload an image (JPG, PNG, WEBP)", type=["jpg", "jpeg", "png", "webp"])
 
-            # Smooth frame rate limiter (~30 FPS)
-            time.sleep(0.02)
+    if uploaded_file is not None:
+        file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
+        frame = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
+        detector = DrowsinessDetector(
+            ear_threshold=ear_threshold,
+            model_path=st.session_state.get("model_path")
+        )
+        result = detector.process_frame(frame, draw_landmarks=show_landmarks)
 
-else:
-    # When monitoring is stopped / idle
-    alert_banner_placeholder.markdown("""
-    <div class="alert-banner-safe" style="color: #94a3b8; border-color: #334155; background: #0f172a;">
-        ⏸️ System Idle. Click <strong>'▶️ Start'</strong> in the sidebar to begin real-time drowsiness monitoring.
-    </div>
-    """, unsafe_allow_html=True)
+        update_metrics(
+            eye_status=result["eye_status"],
+            ear_val=result["ear_avg"],
+            total_alerts=st.session_state.total_alerts,
+            monitoring=False
+        )
 
-    # Show informative landing UI with algorithm explanation and quick-start guide
-    col_guide1, col_guide2 = st.columns(2)
+        col_up1, col_up2 = st.columns([3, 2])
+        with col_up1:
+            rgb_res = cv2.cvtColor(result["annotated_frame"], cv2.COLOR_BGR2RGB)
+            st.image(rgb_res, caption="Analyzed Image with Facial Mesh", width="stretch")
 
-    with col_guide1:
-        st.markdown("### 🔬 How It Works")
-        st.markdown("""
-        1. **Facial Landmark Mesh**: The laptop webcam captures real-time video frames. Google MediaPipe's deep-learning model maps **468 3D facial landmarks**.
-        2. **Eye Aspect Ratio (EAR)**: The 6 landmark coordinates surrounding each eye are extracted:
-           $$\\text{EAR} = \\frac{||P_2 - P_6|| + ||P_3 - P_5||}{2 \\cdot ||P_1 - P_4||}$$
-        3. **Closure Threshold**: When eyes open, EAR is $\\approx 0.28 - 0.38$. When closed, EAR plummets below $0.20$.
-        4. **Temporal Filter**: A normal human blink lasts $100 - 300\\text{ ms}$. If eye closure persists for $> 1.5\\text{ seconds}$ (or $\\ge 25$ frames), a **Drowsiness Alert** triggers.
-        """)
-
-    with col_guide2:
-        st.markdown("### 📋 Quick Demonstration Checklist")
-        st.markdown("""
-        - [x] Click **'▶️ Start'** in the left sidebar.
-        - [x] Allow webcam access when prompted by the OS.
-        - [x] Verify green eye landmark contours surround your eyes.
-        - [x] **Test 1 - Normal Blink**: Blink naturally; verify system remains **Normal**.
-        - [x] **Test 2 - Sustained Eye Closure**: Close your eyes for $> 2\\text{ seconds}$; verify the red warning banner and sound alert trigger.
-        - [x] Open your eyes again; verify the system resets immediately to **Normal**.
-        - [x] Click **'⏹️ Stop'** when finished.
-        """)
+        with col_up2:
+            st.markdown("#### Diagnostic Report")
+            if result["face_detected"]:
+                if result["ear_avg"] < ear_threshold:
+                    st.error(f"😴 **EYES CLOSED** (EAR: {result['ear_avg']:.3f})")
+                else:
+                    st.success(f"👁️ **EYES OPEN** (EAR: {result['ear_avg']:.3f})")
+                st.write(f"- **Left Eye EAR:** {result['ear_left']:.3f}")
+                st.write(f"- **Right Eye EAR:** {result['ear_right']:.3f}")
+                st.write(f"- **Average EAR:** {result['ear_avg']:.3f}")
+            else:
+                st.warning("No face detected in this image.")
 
 
 # ---------------------------------------------------------
